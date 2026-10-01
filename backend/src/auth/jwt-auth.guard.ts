@@ -27,8 +27,10 @@ import { IS_PUBLIC_KEY } from './decorators/public.decorator';
  * and the integration route groups (IMPERSONATION_WRITE_PREFIXES) — admins
  * deliberately set up integrations on the firm's behalf via "View as company". Enforced HERE — rather than a standalone global guard —
  * because JwtAuthGuard is the sole interception point that runs on every
- * authenticated route AND has already populated `req.session` (there is no
- * global APP_GUARD in this app).
+ * authenticated route AND has already populated `req.session`. Both
+ * JwtAuthGuard and RolesGuard are registered as global APP_GUARDs in
+ * AuthModule; JwtAuthGuard runs first (registration order) to populate
+ * req.session before RolesGuard inspects it.
  */
 const READ_ONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** Mutating routes still permitted while impersonating (must be able to exit). */

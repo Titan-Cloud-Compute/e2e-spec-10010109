@@ -168,7 +168,10 @@ export class AuthController {
 
   /**
    * Create an invite token a teammate can use to sign up.
+   * Restricted to ADMIN — only administrators may provision new accounts
+   * (auth model: admin_only).
    */
+  @RequireAdmin()
   @UseGuards(JwtAuthGuard)
   @Post('invite')
   @HttpCode(HttpStatus.CREATED)
