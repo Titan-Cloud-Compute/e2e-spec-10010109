@@ -1,11 +1,9 @@
 /**
- * Typed fetch wrapper for the NestJS REST backend.
+ * ApiClient hierarchy for the NestJS REST backend.
  *
- * - sends cookies on every request (`credentials: 'include'`) so the httpOnly
- *   JWT session cookie set by /api/auth/login is round-tripped automatically
- * - JSON request / response handling with multipart support for file uploads
- * - maps HTTP error codes to typed error classes so consumers can branch on them
- *   without inspecting `error.message` strings
+ * Abstract base:  ApiClient       — DI token + convenience helpers
+ * HTTP impl:      HttpApiClient   — fetch-based, sends cookies, maps HTTP errors
+ * Mock impl:      MockApiClient   — in-memory handlers, used when USE_MOCKS is set
  *
  * Status mapping (matches GlobalExceptionFilter on the backend):
  *   400 → BadRequestError
@@ -18,6 +16,8 @@
  */
 
 import { Injectable } from '@angular/core';
+
+// ─── Error classes ────────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
   status: number;
@@ -68,6 +68,8 @@ export class ServiceUnavailableError extends ApiError {
   }
 }
 
+// ─── Request options ──────────────────────────────────────────────────────────
+
 export interface RequestOpts {
   method?: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
   body?: unknown;
@@ -84,8 +86,49 @@ export interface RequestOpts {
  */
 export type ApiErrorListener = (err: ApiError) => void;
 
-@Injectable({ providedIn: 'root' })
-export class ApiClient {
+// ─── Abstract base class (DI token) ──────────────────────────────────────────
+
+/**
+ * Abstract ApiClient — use this as the DI token.
+ *
+ * Provide either HttpApiClient (production) or MockApiClient (USE_MOCKS) in
+ * app.config.ts:
+ *   { provide: ApiClient, useClass: environment.useMocks ? MockApiClient : HttpApiClient }
+ */
+@Injectable()
+export abstract class ApiClient {
+  /** Core method — subclasses implement this. */
+  abstract request<T = unknown>(path: string, opts?: RequestOpts): Promise<T>;
+
+  get<T = unknown>(path: string, query?: RequestOpts['query']): Promise<T> {
+    return this.request<T>(path, { method: 'GET', query });
+  }
+  post<T = unknown>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>(path, { method: 'POST', body });
+  }
+  patch<T = unknown>(path: string, body?: unknown): Promise<T> {
+    return this.request<T>(path, { method: 'PATCH', body });
+  }
+  delete<T = unknown>(path: string): Promise<T> {
+    return this.request<T>(path, { method: 'DELETE' });
+  }
+  postMultipart<T = unknown>(path: string, form: FormData): Promise<T> {
+    return this.request<T>(path, { method: 'POST', body: form, multipart: true });
+  }
+}
+
+// ─── HTTP implementation ──────────────────────────────────────────────────────
+
+/**
+ * HttpApiClient — fetch-based implementation for production.
+ *
+ * - sends cookies on every request (`credentials: 'include'`) so the httpOnly
+ *   JWT session cookie set by /api/auth/login is round-tripped automatically
+ * - JSON request / response handling with multipart support for file uploads
+ * - maps HTTP error codes to typed error classes
+ */
+@Injectable()
+export class HttpApiClient extends ApiClient {
   /**
    * In dev, ng serve typically proxies /api to the backend.
    * In prod, both are served from the same host so a relative base works.
@@ -110,10 +153,7 @@ export class ApiClient {
   private buildUrl(path: string, query?: RequestOpts['query']): string {
     // Resolve RELATIVE when no explicit baseUrl is set: fetch() resolves a
     // relative URL against the document base, which carries the deployment's
-    // path prefix (e.g. /my-app-staging/ behind the staging proxy). The
-    // previous absolute form ('' + '/api/...') escaped that prefix and 404'd
-    // every prefsApi/consent call on prefixed deployments — which silently
-    // degraded the chat model picker to the full-catalog fallback.
+    // path prefix. The previous absolute form escaped that prefix and 404'd.
     const rel = path.replace(/^\/+/, '');
     const url = this.baseUrl ? `${this.baseUrl}/${rel}` : rel;
     if (!query) return url;
@@ -126,7 +166,7 @@ export class ApiClient {
     return s ? `${url}?${s}` : url;
   }
 
-  async request<T = unknown>(path: string, opts: RequestOpts = {}): Promise<T> {
+  override async request<T = unknown>(path: string, opts: RequestOpts = {}): Promise<T> {
     const { method = 'GET', body, multipart, query, signal } = opts;
     const url = this.buildUrl(path, query);
 
@@ -135,7 +175,6 @@ export class ApiClient {
 
     if (body !== undefined) {
       if (multipart) {
-        // body is expected to be a FormData instance (or a plain object we coerce)
         if (body instanceof FormData) {
           payload = body;
         } else {
@@ -166,7 +205,6 @@ export class ApiClient {
         signal,
       });
     } catch (networkErr: any) {
-      // network failure / CORS — surface as a 503 so the UI can show retry CTA
       const err = new ServiceUnavailableError(
         networkErr?.message || 'Network error',
         { service: 'network' },
@@ -204,20 +242,48 @@ export class ApiClient {
 
     return parsed as T;
   }
+}
 
-  get<T = unknown>(path: string, query?: RequestOpts['query']): Promise<T> {
-    return this.request<T>(path, { method: 'GET', query });
+// ─── Mock implementation ──────────────────────────────────────────────────────
+
+/** Handler function type for MockApiClient — receives the request body and returns a response. */
+export type MockHandler<T = unknown> = (body?: unknown) => Promise<T>;
+
+/**
+ * MockApiClient — in-memory implementation for USE_MOCKS mode.
+ *
+ * Feature cards register handlers for their endpoints:
+ *
+ *   mockClient.registerMock('GET', '/api/my-feature/items', async () => fixtures.items);
+ *   mockClient.registerMock('POST', '/api/my-feature/items', async (body) => ({ ...body, id: '1' }));
+ *
+ * Handlers are keyed by `${METHOD} ${path}` (upper-cased method).
+ *
+ * Seed from contract fixtures when present (uncomment and adapt):
+ *   // import type { MyFixtures } from '@contracts/my-feature/fixtures';
+ *   // import { myFixtures } from '@contracts/my-feature/fixtures';
+ *   // mockClient.registerMock('GET', '/api/my-feature/items', async () => myFixtures.items);
+ */
+@Injectable()
+export class MockApiClient extends ApiClient {
+  private readonly handlers = new Map<string, MockHandler>();
+
+  /**
+   * Register a mock handler for a given HTTP method + path combination.
+   * Call this during app initialisation (e.g. in app.config.ts) or inside
+   * the feature's own initialiser.
+   */
+  registerMock<T = unknown>(method: string, path: string, handler: MockHandler<T>): void {
+    this.handlers.set(`${method.toUpperCase()} ${path}`, handler as MockHandler);
   }
-  post<T = unknown>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>(path, { method: 'POST', body });
-  }
-  patch<T = unknown>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>(path, { method: 'PATCH', body });
-  }
-  delete<T = unknown>(path: string): Promise<T> {
-    return this.request<T>(path, { method: 'DELETE' });
-  }
-  postMultipart<T = unknown>(path: string, form: FormData): Promise<T> {
-    return this.request<T>(path, { method: 'POST', body: form, multipart: true });
+
+  override async request<T = unknown>(path: string, opts: RequestOpts = {}): Promise<T> {
+    const method = (opts.method ?? 'GET').toUpperCase();
+    const key = `${method} ${path}`;
+    const handler = this.handlers.get(key);
+    if (!handler) {
+      throw new NotFoundError(`[MockApiClient] No mock registered for ${key}`);
+    }
+    return handler(opts.body) as Promise<T>;
   }
 }

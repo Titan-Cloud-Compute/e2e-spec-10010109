@@ -11,6 +11,8 @@ import { routes } from './app.routes';
 import { apiErrorInterceptor } from './shared/api/api-error.interceptor';
 import { ChunkErrorHandler, isChunkLoadError, reloadForChunkError } from './shared/chunk-error.handler';
 import { PREVIEW_MODE } from './shared/preview/preview-mode';
+import { ApiClient, HttpApiClient, MockApiClient } from './shared/api/api-client';
+import { environment } from '../environments/environment';
 
 /**
  * Hash routing (#/route) everywhere EXCEPT the static design-review preview.
@@ -71,5 +73,7 @@ export const appConfig: ApplicationConfig = {
     provideAnimations(),
     // Catch dynamic-import / chunk failures that don't surface via the router.
     { provide: ErrorHandler, useClass: ChunkErrorHandler },
+    // ApiClient: swap to MockApiClient when USE_MOCKS is set (dev / stories).
+    { provide: ApiClient, useClass: environment.useMocks ? MockApiClient : HttpApiClient },
   ],
 };

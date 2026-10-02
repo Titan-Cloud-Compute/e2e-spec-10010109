@@ -20,6 +20,8 @@
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true,
     "strict": true,
-    "paths": {}
+    "paths": {
+      "@contracts/*": ["src/shared/contracts/*"]
+    }
   }
 }
